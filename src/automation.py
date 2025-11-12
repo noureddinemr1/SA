@@ -1,6 +1,6 @@
 from playwright.async_api import async_playwright
 import asyncio
-from src.config import TARGET_URL, BRIGHT_DATA_USERNAME, BRIGHT_DATA_PASSWORD, TIMEOUT, CERTIFICATE_PATH, CERTIFICATE_PASSWORD
+from src.config import TARGET_URL, BRIGHT_DATA_USERNAME, BRIGHT_DATA_PASSWORD, TIMEOUT, CERTIFICATE_PATH, CERTIFICATE_PASSWORD, CAPTCHA_POST_SOLVE_WAIT, CAPTCHA_SUBMIT_DELAY
 from src.captcha_solver import BrightDataCaptchaSolver
 import base64
 import os
@@ -10,6 +10,38 @@ class BrightDataFullAutomation:
     def __init__(self):
         self.ready_to_submit = False
         self.blocked_requests = []
+    
+    async def verify_certificate(self, cdp_session, cert_base64, cert_password):
+        """Verify that the certificate is valid before attempting to use it"""
+        try:
+            print("   🔍 Verifying certificate validity...")
+            
+            # Try to add the certificate - if it fails, it's likely invalid
+            result = await cdp_session.send('Browser.addCertificate', {
+                'cert': cert_base64,
+                'pass': cert_password
+            })
+            
+            print(f"   ✅ Certificate is valid and injected successfully")
+            print(f"   📋 Result: {result}")
+            return True
+            
+        except Exception as e:
+            error_msg = str(e).lower()
+            
+            if 'password' in error_msg or 'decrypt' in error_msg:
+                print(f"   ❌ Certificate password is incorrect!")
+                print(f"   💡 Check CERTIFICATE_PASSWORD in your .env file")
+            elif 'expired' in error_msg:
+                print(f"   ❌ Certificate has expired!")
+                print(f"   💡 You need to obtain a new certificate")
+            elif 'invalid' in error_msg or 'malformed' in error_msg:
+                print(f"   ❌ Certificate file is invalid or corrupted!")
+                print(f"   💡 Check the .pfx file integrity")
+            else:
+                print(f"   ❌ Certificate verification failed: {e}")
+            
+            return False
     
     async def wait_for_captcha_with_debug(self, page, max_wait_seconds=30):
         """Wait for captcha to appear with detailed debugging"""
@@ -159,6 +191,15 @@ class BrightDataFullAutomation:
                     const authzEl = document.querySelector('input[name="authorization_id"]');
                     const authz = authzEl?.value || '';
                     
+                    // Get all form inputs to debug
+                    const form = document.querySelector('form');
+                    const allInputs = form ? Array.from(form.querySelectorAll('input, textarea')).map(el => ({
+                        name: el.name,
+                        type: el.type || 'textarea',
+                        hasValue: !!el.value,
+                        valueLength: (el.value || '').length
+                    })) : [];
+                    
                     return {
                         hasToken: token.length > 1000,
                         tokenLength: token.length,
@@ -166,7 +207,8 @@ class BrightDataFullAutomation:
                         hasAuthz: authz.length > 0,
                         csrfValue: csrf.substring(0, 20),
                         authzValue: authz.substring(0, 20),
-                        formAction: document.querySelector('form')?.action || 'none'
+                        formAction: document.querySelector('form')?.action || 'none',
+                        allInputs: allInputs
                     };
                 }
             """)
@@ -176,10 +218,26 @@ class BrightDataFullAutomation:
             print(f"   🆔 Authorization: {validation['hasAuthz']} ({validation['authzValue']}...)")
             print(f"   📍 Form action: {validation['formAction']}")
             
+            # Show all form fields for debugging
+            if validation.get('allInputs'):
+                print(f"   📋 All form fields ({len(validation['allInputs'])} total):")
+                for inp in validation['allInputs'][:10]:  # Show first 10
+                    print(f"      - {inp['name'] or '[no name]'} ({inp['type']}): {'✓' if inp['hasValue'] else '✗'} ({inp['valueLength']} chars)")
+            
             # Token and CSRF are critical; authorization_id might not always be present
-            return validation['hasToken'] and validation['hasCsrf']
+            is_ready = validation['hasToken'] and validation['hasCsrf']
+            
+            if not is_ready:
+                if not validation['hasToken']:
+                    print(f"   ❌ Token missing or too short (need >1000 chars, got {validation['tokenLength']})")
+                if not validation['hasCsrf']:
+                    print(f"   ❌ CSRF token missing")
+            
+            return is_ready
         except Exception as e:
             print(f"   ⚠️ Token verification failed: {e}")
+            import traceback
+            traceback.print_exc()
             return False
     
     async def get_captcha_response_from_cdp(self, cdp_session):
@@ -413,12 +471,25 @@ class BrightDataFullAutomation:
                             window.__captcha_token_captured = null;
                             window.__token_observer_active = true;
                             
+                            // Method 0: Intercept hCaptcha callback
+                            if (window.hcaptcha) {
+                                const originalSetResponse = window.hcaptcha.setResponse || (() => {});
+                                window.hcaptcha.setResponse = function(widgetId, token) {
+                                    if (token && token.length > 1000) {
+                                        console.log('🎯 TOKEN CAPTURED from hcaptcha.setResponse:', token.length, 'chars');
+                                        window.__captcha_token_captured = token;
+                                        window.__token_observer_active = false;
+                                    }
+                                    return originalSetResponse.apply(this, arguments);
+                                };
+                            }
+                            
                             // Method 1: MutationObserver on textarea
                             const observer = new MutationObserver(() => {
                                 if (!window.__token_observer_active) return;
                                 const textarea = document.querySelector('textarea[name="h-captcha-response"]');
                                 if (textarea && textarea.value && textarea.value.length > 1000) {
-                                    console.log('🎯 TOKEN CAPTURED:', textarea.value.length, 'chars');
+                                    console.log('🎯 TOKEN CAPTURED from textarea:', textarea.value.length, 'chars');
                                     window.__captcha_token_captured = textarea.value;
                                     window.__token_observer_active = false;
                                 }
@@ -436,16 +507,32 @@ class BrightDataFullAutomation:
                                     clearInterval(pollInterval);
                                     return;
                                 }
+                                
+                                // Check textarea
                                 const textarea = document.querySelector('textarea[name="h-captcha-response"]');
                                 if (textarea && textarea.value && textarea.value.length > 1000) {
                                     console.log('🎯 TOKEN CAPTURED (poll):', textarea.value.length, 'chars');
                                     window.__captcha_token_captured = textarea.value;
                                     window.__token_observer_active = false;
                                     clearInterval(pollInterval);
+                                    return;
+                                }
+                                
+                                // Check hCaptcha API
+                                if (window.hcaptcha && window.hcaptcha.getResponse) {
+                                    try {
+                                        const token = window.hcaptcha.getResponse();
+                                        if (token && token.length > 1000) {
+                                            console.log('🎯 TOKEN CAPTURED from API (poll):', token.length, 'chars');
+                                            window.__captcha_token_captured = token;
+                                            window.__token_observer_active = false;
+                                            clearInterval(pollInterval);
+                                        }
+                                    } catch(e) {}
                                 }
                             }, 100);
                             
-                            console.log('✅ Token observer activated');
+                            console.log('✅ Token observer activated (3 methods)');
                         }
                     """)
                     
@@ -456,53 +543,81 @@ class BrightDataFullAutomation:
                     if success:
                         print("   ✅ Captcha solved, waiting for token...")
                         
+                        # CRITICAL: Increased wait time for hCaptcha backend validation
+                        print(f"   ⏳ Waiting {CAPTCHA_POST_SOLVE_WAIT} seconds for hCaptcha to fully validate token on their servers...")
+                        await asyncio.sleep(CAPTCHA_POST_SOLVE_WAIT)  # Configurable from .env
+                        print("   ✅ Validation period complete")
+                        
                         # CRITICAL: Wait for Bright Data to attempt auto-submit (which we'll block and capture)
                         print("   ⏳ Waiting for auto-submit attempt (which we'll block)...")
-                        await asyncio.sleep(8)  # Give time for blocked POST to happen
+                        await asyncio.sleep(5)  # Additional wait for token propagation
                         
-                        # First, check if we captured token from blocked request
+                        # PRIORITY 1: Check if we captured token from blocked POST request
                         if self.captured_token_from_request and len(self.captured_token_from_request) > 1000:
-                            print(f"   🎯 Using token captured from blocked request! (length: {len(self.captured_token_from_request)})")
+                            print(f"   🎯 Using token captured from blocked POST request! (length: {len(self.captured_token_from_request)})")
                             token = {'source': 'blocked-request', 'token': self.captured_token_from_request}
+                        # PRIORITY 2: Check if our observer caught the token
                         else:
-                            # Check if our observer caught the token
                             print("   🔍 Checking if token observer captured token...")
                             captured_token = await page.evaluate("() => window.__captcha_token_captured")
                             
                             if captured_token and len(captured_token) > 1000:
                                 print(f"   🎯 TOKEN CAPTURED BY OBSERVER! (length: {len(captured_token)})")
                                 token = {'source': 'observer', 'token': captured_token}
+                            # PRIORITY 3: Try direct extraction from hCaptcha API
                             else:
-                                # Wait a bit more and try multiple methods to get the token
-                                print("   ⏳ Token not captured yet, waiting and trying retrieval methods...")
-                                await asyncio.sleep(3)
+                                print("   ⏳ Token not captured yet, trying direct API extraction...")
+                                await asyncio.sleep(2)
                                 
-                                print("   🔍 Attempting to retrieve token from page...")
-                                
-                                token = await page.evaluate("""
-                                () => {
-                                    // Check captured token first
-                                    if (window.__captcha_token_captured && window.__captcha_token_captured.length > 1000) {
-                                        return { source: 'observer-delayed', token: window.__captcha_token_captured };
-                                    }
-                                    
-                                    // Method 1: hCaptcha API
-                                    if (window.hcaptcha && window.hcaptcha.getResponse) {
-                                        try {
-                                            const token = window.hcaptcha.getResponse();
-                                            if (token && token.length > 100) {
-                                                return { source: 'hcaptcha.getResponse', token: token };
+                                # Try to get token directly from hCaptcha API
+                                api_token = await page.evaluate("""
+                                    () => {
+                                        if (window.hcaptcha && window.hcaptcha.getResponse) {
+                                            try {
+                                                const token = window.hcaptcha.getResponse();
+                                                if (token && token.length > 1000) {
+                                                    return token;
+                                                }
+                                            } catch(e) {
+                                                console.error('Failed to get hcaptcha response:', e);
                                             }
-                                        } catch(e) {}
+                                        }
+                                        return null;
+                                    }
+                                """)
+                                
+                                if api_token and len(api_token) > 1000:
+                                    print(f"   🎯 TOKEN EXTRACTED from hCaptcha API! (length: {len(api_token)})")
+                                    token = {'source': 'hcaptcha-api', 'token': api_token}
+                                # PRIORITY 4: Try all textareas
+                                else:
+                                    print("   🔍 Attempting to retrieve token from page textareas...")
+                                    await asyncio.sleep(1)
+                                    
+                                    token = await page.evaluate("""
+                                    () => {
+                                        // Check captured token first
+                                        if (window.__captcha_token_captured && window.__captcha_token_captured.length > 1000) {
+                                            return { source: 'observer-delayed', token: window.__captcha_token_captured };
+                                        }
+                                        
+                                        // Method 1: hCaptcha API
+                                        if (window.hcaptcha && window.hcaptcha.getResponse) {
+                                            try {
+                                                const token = window.hcaptcha.getResponse();
+                                                if (token && token.length > 100) {
+                                                    return { source: 'hcaptcha.getResponse', token: token };
+                                                }
+                                            } catch(e) {}
+                                        }
+                                        
+                                        // Method 2: Textarea
+                                        const textarea = document.querySelector('textarea[name="h-captcha-response"]');
+                                        if (textarea && textarea.value && textarea.value.length > 100) {
+                                        return { source: 'textarea', token: textarea.value };
                                     }
                                     
-                                    // Method 2: Textarea
-                                    const textarea = document.querySelector('textarea[name="h-captcha-response"]');
-                                    if (textarea && textarea.value && textarea.value.length > 100) {
-                                    return { source: 'textarea', token: textarea.value };
-                                }
-                                
-                                // Method 3: All textareas (in case of dynamic creation)
+                                    // Method 3: All textareas (in case of dynamic creation)
                                 const allTextareas = document.querySelectorAll('textarea');
                                 for (const ta of allTextareas) {
                                     if (ta.value && ta.value.length > 1000 && ta.value.startsWith('P')) {
@@ -965,6 +1080,10 @@ class BrightDataFullAutomation:
                                     token = data.get('h-captcha-response', [''])[0]
                                     token_length = len(token)
                                     if token and token_length > 1000:
+                                        # 🎯 CAPTURE the token from this request!
+                                        if not self.captured_token_from_request:
+                                            print(f"   🎯 CAPTURING token from POST request ({token_length} chars)")
+                                            self.captured_token_from_request = token
                                         self.form_submitted = True
                                         self.ready_to_submit = True
                             except Exception as e:
@@ -974,12 +1093,12 @@ class BrightDataFullAutomation:
                             if not self.first_submission_delayed and token_length > 1000:
                                 print(f"   ⏸️ DELAYING first POST to allow hCaptcha backend validation...")
                                 print(f"   📤 Token length: {token_length} chars")
-                                print(f"   ⏳ Waiting 6 seconds for hCaptcha to validate token on their servers...")
-                                await asyncio.sleep(6)
+                                print(f"   ⏳ Waiting {CAPTCHA_SUBMIT_DELAY} seconds for hCaptcha to validate token on their servers...")
+                                await asyncio.sleep(CAPTCHA_SUBMIT_DELAY)  # Configurable from .env
                                 self.first_submission_delayed = True
                                 print(f"   ✅ Delay complete - ALLOWING POST to {request.url.split('/')[-1]}")
-                            else:
-                                print(f"   ✅ ALLOWING POST to {request.url.split('/')[-1]}")
+                            elif token_length > 1000:
+                                print(f"   ✅ ALLOWING POST to {request.url.split('/')[-1]} (token: {token_length} chars)")
                         
                         # Allow all other requests
                         await route.continue_()
@@ -1043,9 +1162,13 @@ class BrightDataFullAutomation:
                     # Monitor responses for debugging
                     async def handle_response(response):
                         if response.status >= 400:
-                            print(f"   ⚠️ HTTP {response.status}: {response.url}")
-                            # Try to get response body for 400 errors
-                            if response.status == 400:
+                            # Special handling for different error types
+                            if response.status == 502:
+                                print(f"   ⚠️ HTTP 502 (Bad Gateway): {response.url}")
+                                print(f"      This is a temporary server issue - resource may load on retry")
+                            elif response.status == 400:
+                                print(f"   ⚠️ HTTP 400 (Bad Request): {response.url}")
+                                # Try to get response body for 400 errors
                                 try:
                                     body = await response.text()
                                     if body:
@@ -1057,24 +1180,32 @@ class BrightDataFullAutomation:
                                             validation_state["reason"] = "Server rejected captcha with 400 error"
                                             validation_state["timestamp"] = time.time()
                                             print(f"   🚨 DETECTED: Server rejected captcha solution!")
+                                            print(f"   💡 Possible causes:")
+                                            print(f"      - Token submitted too quickly (before hCaptcha backend validated)")
+                                            print(f"      - Missing required form fields (CSRF, authorization_id)")
+                                            print(f"      - Token expired before submission")
                                 except Exception as e:
                                     pass
+                            else:
+                                print(f"   ⚠️ HTTP {response.status}: {response.url}")
                     
                     page.on("response", lambda response: asyncio.create_task(handle_response(response)))
                     
                     print("   ✅ Connected\n")
                     
-                    print("🔐 Injecting certificate via Browser.addCertificate...")
-                    try:
-                        result = await cdp_session.send('Browser.addCertificate', {
-                            'cert': cert_base64,
-                            'pass': CERTIFICATE_PASSWORD
-                        })
-                        print(f"   ✅ Certificate injected: {result}\n")
-                    except Exception as e:
-                        print(f"   ❌ Failed: {e}\n")
+                    print("🔐 Verifying and injecting certificate...")
+                    cert_valid = await self.verify_certificate(cdp_session, cert_base64, CERTIFICATE_PASSWORD)
+                    
+                    if not cert_valid:
+                        print("\n❌ Certificate verification failed - cannot proceed")
+                        print("💡 Please check:")
+                        print("   - Certificate file is not corrupted")
+                        print("   - CERTIFICATE_PASSWORD is correct in .env file")
+                        print("   - Certificate has not expired")
                         await browser.close()
                         continue
+                    
+                    print()
                     
                     print(f"📍 Navigating to {TARGET_URL}...")
                     await page.goto(TARGET_URL, wait_until='domcontentloaded', timeout=30000)

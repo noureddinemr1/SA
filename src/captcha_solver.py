@@ -68,8 +68,8 @@ class BrightDataCaptchaSolver:
                 elapsed = time.time() - start_time
                 print(f"   ⏰ Captcha solve timed out after {elapsed:.1f}s")
                 print(f"   💡 Token was generated, but we need to wait for hCaptcha server validation")
-                print(f"   ⏳ Waiting 5 seconds for hCaptcha backend to validate the token...")
-                await asyncio.sleep(5)
+                print(f"   ⏳ Waiting 8 seconds for hCaptcha backend to validate the token...")
+                await asyncio.sleep(8)  # Increased from 5 to 8 seconds
                 print(f"   ✅ Validation wait complete - assuming token is now valid")
                 return True
                 
